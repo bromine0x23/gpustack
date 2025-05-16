@@ -93,7 +93,12 @@ class ActiveRecordMixin:
         return result.all()
 
     @classmethod
-    async def all_by_fields(cls, session: AsyncSession, fields: dict):
+    async def all_by_fields(
+        cls,
+        session: AsyncSession,
+        fields: dict = {},
+        extra_conditions: Optional[List] = None,
+    ):
         """
         Return all objects with the given fields and values.
         Return an empty list if not found.
@@ -102,6 +107,10 @@ class ActiveRecordMixin:
         statement = select(cls)
         for key, value in fields.items():
             statement = statement.where(getattr(cls, key) == value)
+
+        if extra_conditions:
+            statement = statement.where(and_(*extra_conditions))
+
         result = await session.exec(statement)
         return result.all()
 
@@ -142,7 +151,7 @@ class ActiveRecordMixin:
 
         if fuzzy_fields:
             fuzzy_conditions = [
-                col(getattr(cls, key)).like(f"%{value}%")
+                func.lower(getattr(cls, key)).like(f"%{str(value).lower()}%")
                 for key, value in fuzzy_fields.items()
             ]
             statement = statement.where(or_(*fuzzy_conditions))
@@ -428,7 +437,8 @@ class ActiveRecordMixin:
     def _match_fuzzy_fields(cls, event: Any, fuzzy_fields: Optional[dict]) -> bool:
         """Match fuzzy fields using OR condition."""
         for key, value in (fuzzy_fields or {}).items():
-            if value in str(getattr(event.data, key, "")):
+            attr_value = str(getattr(event.data, key, "")).lower()
+            if str(value).lower() in attr_value:
                 return True
         return not fuzzy_fields
 

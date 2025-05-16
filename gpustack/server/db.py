@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+import os
 import re
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -18,9 +20,16 @@ from gpustack.schemas.stmt import (
     worker_after_drop_view_stmt_sqlite,
     worker_after_create_view_stmt_postgres,
     worker_after_drop_view_stmt_postgres,
+    worker_after_create_view_stmt_mysql,
+    worker_after_drop_view_stmt_mysql,
 )
 
 _engine = None
+
+DB_ECHO = os.getenv("GPUSTACK_DB_ECHO", "false").lower() == "true"
+DB_POOL_SIZE = int(os.getenv("GPUSTACK_DB_POOL_SIZE", 5))
+DB_MAX_OVERFLOW = int(os.getenv("GPUSTACK_DB_MAX_OVERFLOW", 10))
+DB_POOL_TIMEOUT = int(os.getenv("GPUSTACK_DB_POOL_TIMEOUT", 30))
 
 
 def get_engine():
@@ -28,6 +37,12 @@ def get_engine():
 
 
 async def get_session():
+    async with AsyncSession(_engine) as session:
+        yield session
+
+
+@asynccontextmanager
+async def get_session_context():
     async with AsyncSession(_engine) as session:
         yield session
 
@@ -42,10 +57,19 @@ async def init_db(db_url: str):
             db_url = re.sub(r'^sqlite://', 'sqlite+aiosqlite://', db_url)
         elif db_url.startswith("postgresql://"):
             db_url = re.sub(r'^postgresql://', 'postgresql+asyncpg://', db_url)
+        elif db_url.startswith("mysql://"):
+            db_url = re.sub(r'^mysql://', 'mysql+asyncmy://', db_url)
         else:
             raise Exception(f"Unsupported database URL: {db_url}")
 
-        _engine = create_async_engine(db_url, echo=False, connect_args=connect_args)
+        _engine = create_async_engine(
+            db_url,
+            echo=DB_ECHO,
+            pool_size=DB_POOL_SIZE,
+            max_overflow=DB_MAX_OVERFLOW,
+            pool_timeout=DB_POOL_TIMEOUT,
+            connect_args=connect_args,
+        )
         listen_events(_engine)
     await create_db_and_tables(_engine)
 
@@ -70,6 +94,9 @@ def listen_events(engine: AsyncEngine):
     if engine.dialect.name == "postgresql":
         worker_after_drop_view_stmt = worker_after_drop_view_stmt_postgres
         worker_after_create_view_stmt = worker_after_create_view_stmt_postgres
+    elif engine.dialect.name == "mysql":
+        worker_after_drop_view_stmt = worker_after_drop_view_stmt_mysql
+        worker_after_create_view_stmt = worker_after_create_view_stmt_mysql
     else:
         worker_after_drop_view_stmt = worker_after_drop_view_stmt_sqlite
         worker_after_create_view_stmt = worker_after_create_view_stmt_sqlite

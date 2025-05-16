@@ -32,16 +32,20 @@ GPUStack 是一个用于运行 AI 模型的开源 GPU 集群管理器。
 
 ### 核心特性
 
-- **广泛的硬件兼容性**：支持管理 Apple Mac、Windows PC 和 Linux 服务器上不同品牌的 GPU。
-- **广泛的模型支持**：从大语言模型 LLM、多模态模型 VLM 到 Diffusion 扩散模型、STT 与 TTS 语音模型、文本嵌入和重排序模型的广泛支持。
-- **异构 GPU 支持与扩展**：轻松添加异构 GPU 资源，按需扩展算力规模。
-- **分布式推理**：支持单机多卡并行和多机多卡并行推理。
-- **多推理后端支持**：支持 llama-box（基于 llama.cpp 和 stable-diffusion.cpp）、vox-box 和 vLLM 作为推理后端。
-- **轻量级 Python 包**：最小的依赖和操作开销。
-- **OpenAI 兼容 API**：提供兼容 OpenAI 标准的 API 服务。
-- **用户和 API 密钥管理**：简化用户和 API 密钥的管理流程。
-- **GPU 指标监控**：实时监控 GPU 性能和利用率。
-- **Token 使用和速率统计**：有效跟踪 token 使用情况，并管理速率限制。
+- **广泛的 GPU 兼容性**：无缝支持 Apple Mac、Windows PC 和 Linux 服务器上各种供应商的 GPU。
+- **广泛的模型支持**：支持各种模型，包括 LLM、多模态 VLM、图像模型、语音模型、文本嵌入模型和重排序模型。
+- **灵活的推理后端**：与 llama-box（llama.cpp 和 stable-diffusion.cpp）、vox-box、vLLM 和 Ascend MindIE 集成。
+- **多版本后端支持**：同时运行推理后端的多个版本，以满足不同模型的不同运行依赖。
+- **分布式推理**：支持单机和多机多卡并行推理，包括跨供应商和运行环境的异构 GPU。
+- **可扩展的 GPU 架构**：通过向基础设施添加更多 GPU 或节点轻松进行扩展。
+- **强大的模型稳定性**：通过自动故障恢复、多实例冗余和推理请求的负载平衡确保高可用性。
+- **智能部署评估**：自动评估模型资源需求、后端和架构兼容性、操作系统兼容性以及其他与部署相关的因素。
+- **自动调度**：根据可用资源动态分配模型。
+- **轻量级 Python 包**：最小依赖性和低操作开销。
+- **OpenAI 兼容 API**：完全兼容 OpenAI 的 API 规范，实现无缝集成。
+- **用户和 API 密钥管理**：简化用户和 API 密钥的管理。
+- **实时 GPU 监控**：实时跟踪 GPU 性能和利用率。
+- **令牌和速率指标**：监控 Token 使用情况和 API 请求速率。
 
 ## 安装
 
@@ -64,7 +68,7 @@ Invoke-Expression (Invoke-WebRequest -Uri "https://get.gpustack.ai" -UseBasicPar
 
 ### 其他安装方式
 
-有关手动安装、Docker 安装或详细配置选项，请参考[安装文档](https://docs.gpustack.ai/latest/installation/installation-script/)。
+有关 pip 安装、Docker 安装或详细配置选项，请参考[安装文档](https://docs.gpustack.ai/latest/installation/installation-requirements/)。
 
 ## 新手入门
 
@@ -90,9 +94,9 @@ gpustack draw hf.co/gpustack/stable-diffusion-v3-5-large-turbo-GGUF:stable-diffu
 
 ![Generated Image](https://raw.githubusercontent.com/gpustack/gpustack/main/docs/assets/quickstart-minion.png)
 
-3. 在浏览器中打开 `http://myserver`，访问 GPUStack 界面。使用“admin”用户名和默认密码登录 GPUStack。可以执行以下命令获取默认密码：
+3. 在浏览器中打开 `http://your_host_ip`，访问 GPUStack 界面。使用“admin”用户名和默认密码登录 GPUStack。可以执行以下命令获取默认密码：
 
-**Linux or macOS**
+**Linux 或 macOS**
 
 ```bash
 cat /var/lib/gpustack/initial_admin_password
@@ -117,8 +121,8 @@ Get-Content -Path "$env:APPDATA\gpustack\initial_admin_password" -Raw
 8. 现在你可以使用 API 密钥访问 OpenAI 兼容 API。例如，curl 的用法如下：
 
 ```bash
-export GPUSTACK_API_KEY=myapikey
-curl http://myserver/v1-openai/chat/completions \
+export GPUSTACK_API_KEY=your_api_key
+curl http://your_gpustack_server_url/v1-openai/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $GPUSTACK_API_KEY" \
   -d '{
@@ -145,12 +149,12 @@ curl http://myserver/v1-openai/chat/completions \
 
 ## 加速框架支持
 
-- [x] Apple Metal (M 系列芯片)
 - [x] NVIDIA CUDA ([Compute Capability](https://developer.nvidia.com/cuda-gpus) 6.0 以上)
+- [x] Apple Metal (M 系列芯片)
 - [x] AMD ROCm
 - [x] 昇腾 CANN
-- [x] 摩尔线程 MUSA
 - [x] 海光 DTK
+- [x] 摩尔线程 MUSA
 
 我们计划在未来的版本中支持以下加速框架：
 
@@ -159,26 +163,24 @@ curl http://myserver/v1-openai/chat/completions \
 
 ## 模型支持
 
-GPUStack 使用 [llama-box](https://github.com/gpustack/llama-box)（基于 [llama.cpp](https://github.com/ggerganov/llama.cpp) 和 [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)）、[vLLM](https://github.com/vllm-project/vllm) 和 [vox-box](https://github.com/gpustack/vox-box) 作为后端并提供广泛的模型支持。支持从以下来源部署模型：
+GPUStack 使用 [llama-box](https://github.com/gpustack/llama-box)（基于 [llama.cpp](https://github.com/ggml-org/llama.cpp) 和 [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)）、[vLLM](https://github.com/vllm-project/vllm)、 [Ascend MindIE](https://www.hiascend.com/en/software/mindie) 和 [vox-box](https://github.com/gpustack/vox-box) 作为后端并提供广泛的模型支持。支持从以下来源部署模型：
 
 1. [Hugging Face](https://huggingface.co/)
 
 2. [ModelScope](https://modelscope.cn/)
 
-3. [Ollama Library](https://ollama.com/library)
-
-4. 本地文件路径
+3. 本地文件路径
 
 ### 示例模型
 
-| **类别**               | **模型**                                                                                                                                                                                                                                                                                                                                         |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **大语言模型（LLM）**  | [Qwen](https://huggingface.co/models?search=Qwen/Qwen), [LLaMA](https://huggingface.co/meta-llama), [Mistral](https://huggingface.co/mistralai), [Deepseek](https://huggingface.co/models?search=deepseek-ai/deepseek), [Phi](https://huggingface.co/models?search=microsoft/phi), [Yi](https://huggingface.co/models?search=01-ai/Yi)           |
-| **多模态模型（VLM）**  | [Llama3.2-Vision](https://huggingface.co/models?pipeline_tag=image-text-to-text&search=llama3.2), [Pixtral](https://huggingface.co/models?search=pixtral) , [Qwen2-VL](https://huggingface.co/models?search=Qwen/Qwen2-VL), [LLaVA](https://huggingface.co/models?search=llava), [InternVL2.5](https://huggingface.co/models?search=internvl2_5) |
-| **Diffusion 扩散模型** | [Stable Diffusion](https://huggingface.co/models?search=gpustack/stable-diffusion), [FLUX](https://huggingface.co/models?search=gpustack/flux)                                                                                                                                                                                                   |
-| **Embedding 模型**     | [BGE](https://huggingface.co/gpustack/bge-m3-GGUF), [BCE](https://huggingface.co/gpustack/bce-embedding-base_v1-GGUF), [Jina](https://huggingface.co/models?search=gpustack/jina-embeddings)                                                                                                                                                     |
-| **Reranker 模型**      | [BGE](https://huggingface.co/gpustack/bge-reranker-v2-m3-GGUF), [BCE](https://huggingface.co/gpustack/bce-reranker-base_v1-GGUF), [Jina](https://huggingface.co/models?search=gpustack/jina-reranker)                                                                                                                                            |
-| **语音模型**           | [Whisper](https://huggingface.co/models?search=Systran/faster) (speech-to-text), [CosyVoice](https://huggingface.co/models?search=FunAudioLLM/CosyVoice) (text-to-speech)                                                                                                                                                                        |
+| **类别**               | **模型**                                                                                                                                                                                                                                                                                                                                             |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **大语言模型（LLM）**  | [Qwen](https://huggingface.co/models?search=Qwen/Qwen), [LLaMA](https://huggingface.co/meta-llama), [Mistral](https://huggingface.co/mistralai), [DeepSeek](https://huggingface.co/models?search=deepseek-ai/deepseek), [Phi](https://huggingface.co/models?search=microsoft/phi), [Gemma](https://huggingface.co/models?search=Google/gemma)        |
+| **多模态模型（VLM）**  | [Llama3.2-Vision](https://huggingface.co/models?pipeline_tag=image-text-to-text&search=llama3.2), [Pixtral](https://huggingface.co/models?search=pixtral) , [Qwen2.5-VL](https://huggingface.co/models?search=Qwen/Qwen2.5-VL), [LLaVA](https://huggingface.co/models?search=llava), [InternVL2.5](https://huggingface.co/models?search=internvl2_5) |
+| **Diffusion 扩散模型** | [Stable Diffusion](https://huggingface.co/models?search=gpustack/stable-diffusion), [FLUX](https://huggingface.co/models?search=gpustack/flux)                                                                                                                                                                                                       |
+| **Embedding 模型**     | [BGE](https://huggingface.co/gpustack/bge-m3-GGUF), [BCE](https://huggingface.co/gpustack/bce-embedding-base_v1-GGUF), [Jina](https://huggingface.co/models?search=gpustack/jina-embeddings)                                                                                                                                                         |
+| **Reranker 模型**      | [BGE](https://huggingface.co/gpustack/bge-reranker-v2-m3-GGUF), [BCE](https://huggingface.co/gpustack/bce-reranker-base_v1-GGUF), [Jina](https://huggingface.co/models?search=gpustack/jina-reranker)                                                                                                                                                |
+| **语音模型**           | [Whisper](https://huggingface.co/models?search=Systran/faster) (Speech-to-Text), [CosyVoice](https://huggingface.co/models?search=FunAudioLLM/CosyVoice) (Text-to-Speech)                                                                                                                                                                            |
 
 有关支持模型的完整列表，请参阅 [inference backends](https://docs.gpustack.ai/latest/user-guide/inference-backends/) 文档中的 Supported Models 部分。
 
@@ -199,7 +201,7 @@ GPUStack 在 `/v1-openai` 路径提供以下 OpenAI 兼容 API：
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://myserver/v1-openai", api_key="myapikey")
+client = OpenAI(base_url="http://your_gpustack_server_url/v1-openai", api_key="your_api_key")
 
 completion = client.chat.completions.create(
   model="llama3.2",

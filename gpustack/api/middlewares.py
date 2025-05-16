@@ -14,7 +14,6 @@ from openai.types.audio.transcription_create_response import (
     Transcription,
 )
 from openai.types.create_embedding_response import (
-    CreateEmbeddingResponse,
     Usage as EmbeddingUsage,
 )
 from gpustack.routes.rerank import RerankResponse, RerankUsage
@@ -23,9 +22,13 @@ from gpustack.schemas.model_usage import ModelUsage, OperationEnum
 from gpustack.schemas.models import Model
 from gpustack.schemas.users import User
 from gpustack.security import JWT_TOKEN_EXPIRE_MINUTES, JWTManager
-from gpustack.server.auth import SESSION_COOKIE_NAME
+from gpustack.api.auth import SESSION_COOKIE_NAME
 from gpustack.server.db import get_engine
 from sqlmodel.ext.asyncio.session import AsyncSession
+
+from gpustack.server.services import ModelUsageService
+from gpustack.api.types.openai_ext import CreateEmbeddingResponseExt
+
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +57,7 @@ class ModelUsageMiddleware(BaseHTTPMiddleware):
                 return await process_request(
                     request,
                     response,
-                    CreateEmbeddingResponse,
+                    CreateEmbeddingResponseExt,
                     OperationEnum.EMBEDDING,
                 )
             elif (
@@ -102,7 +105,7 @@ async def process_request(
         Union[
             ChatCompletion,
             Completion,
-            CreateEmbeddingResponse,
+            CreateEmbeddingResponseExt,
             RerankResponse,
             ImagesResponse,
             FileResponse,
@@ -147,13 +150,12 @@ async def record_model_usage(
     usage: Union[CompletionUsage, EmbeddingUsage, RerankUsage, None],
     operation: OperationEnum,
 ):
-    prompt_tokens, total_tokens, completion_tokens = 0, 0, 0
-    if usage and hasattr(usage, 'prompt_tokens'):
-        prompt_tokens = usage.prompt_tokens
-        total_tokens = usage.total_tokens
-        completion_tokens = getattr(
-            usage, 'completion_tokens', total_tokens - prompt_tokens
-        )
+    total_tokens = getattr(usage, 'total_tokens', 0) or 0
+    prompt_tokens = getattr(usage, 'prompt_tokens', total_tokens) or total_tokens
+    completion_tokens = (
+        getattr(usage, 'completion_tokens', total_tokens - prompt_tokens)
+        or total_tokens - prompt_tokens
+    )
 
     user: User = request.state.user
     model: Model = request.state.model
@@ -170,14 +172,14 @@ async def record_model_usage(
         request_count=1,
     )
     async with AsyncSession(get_engine()) as session:
-        current_model_usage = await ModelUsage.one_by_fields(session, fields)
+        model_usage_service = ModelUsageService(session)
+        current_model_usage = await model_usage_service.get_by_fields(fields)
         if current_model_usage:
-            current_model_usage.completion_token_count += completion_tokens
-            current_model_usage.prompt_token_count += prompt_tokens
-            current_model_usage.request_count += 1
-            await current_model_usage.update(session)
+            await model_usage_service.update(
+                current_model_usage, completion_tokens, prompt_tokens
+            )
         else:
-            await ModelUsage.create(session, model_usage)
+            await model_usage_service.create(model_usage)
 
 
 async def handle_streaming_response(
@@ -222,24 +224,27 @@ async def process_chunk(
             yield "data: [DONE]\n\n".encode("utf-8")
             continue
 
-        response_dict = None
-        try:
-            response_dict = json.loads(data.strip())
-        except Exception as e:
-            raise e
-        response_chunk = response_class(**response_dict)
+        if '"usage":' in data:
+            response_dict = None
+            try:
+                response_dict = json.loads(data.strip())
+            except Exception as e:
+                raise e
+            response_chunk = response_class(**response_dict)
 
-        if is_usage_chunk(response_chunk):
-            await record_model_usage(request, response_chunk.usage, operation)
+            if is_usage_chunk(response_chunk):
+                await record_model_usage(request, response_chunk.usage, operation)
 
-            # Fill rate metrics. These are extended info not included in OAI APIs.
-            # llama-box provides them out-of-the-box. Align with other backends here.
-            if should_add_metrics(response_dict):
-                add_metrics(response_dict, request, response_chunk)
+                # Fill rate metrics. These are extended info not included in OAI APIs.
+                # llama-box provides them out-of-the-box. Align with other backends here.
+                if should_add_metrics(response_dict):
+                    add_metrics(response_dict, request, response_chunk)
 
-        yield f"data: {json.dumps(response_dict, separators=(',', ':'))}\n\n".encode(
-            "utf-8"
-        )
+            yield f"data: {json.dumps(response_dict, separators=(',', ':'))}\n\n".encode(
+                "utf-8"
+            )
+        else:
+            yield f"{line}\n\n".encode("utf-8")
 
 
 def should_add_metrics(response_dict):
@@ -304,7 +309,7 @@ class RefreshTokenMiddleware(BaseHTTPMiddleware):
 
 
 def is_usage_chunk(
-    chunk: Union[ChatCompletionChunk, Completion, ImageGenerationChunk]
+    chunk: Union[ChatCompletionChunk, Completion, ImageGenerationChunk],
 ) -> bool:
     choices = getattr(chunk, "choices", None)
 

@@ -1,11 +1,11 @@
 import asyncio
+from datetime import datetime, timezone
 import multiprocessing
 import psutil
 import requests
 import setproctitle
 import os
-import time
-from typing import Dict
+from typing import Dict, Optional
 import logging
 
 
@@ -19,9 +19,11 @@ from gpustack.utils.process import terminate_process_tree, add_signal_handlers
 from gpustack.worker.backends.llama_box import LlamaBoxServer
 from gpustack.worker.backends.vox_box import VoxBoxServer
 from gpustack.worker.backends.vllm import VLLMServer
+from gpustack.worker.backends.ascend_mindie import AscendMindIEServer
 from gpustack.client import ClientSet
 from gpustack.schemas.models import (
     BackendEnum,
+    Model,
     ModelInstance,
     ModelInstanceUpdate,
     ModelInstanceStateEnum,
@@ -36,63 +38,72 @@ logger = logging.getLogger(__name__)
 class ServeManager:
     def __init__(
         self,
-        worker_name: str,
+        worker_id: int,
         clientset: ClientSet,
         cfg: Config,
     ):
-        self._worker_name = worker_name
+        self._worker_id = worker_id
         self._config = cfg
         self._serve_log_dir = f"{cfg.log_dir}/serve"
-        self._serving_model_instances: Dict[str, multiprocessing.Process] = {}
-        self._starting_model_instances: Dict[str, ModelInstance] = {}
+        self._serving_model_instances: Dict[int, multiprocessing.Process] = {}
+        self._serving_model_instance_ports: Dict[int, int] = {}
+        self._starting_model_instances: Dict[int, ModelInstance] = {}
+        self._error_model_instances: Dict[int, ModelInstance] = {}
+        self._model_cache_by_instance: Dict[int, Model] = {}
         self._clientset = clientset
         self._cache_dir = cfg.cache_dir
 
         os.makedirs(self._serve_log_dir, exist_ok=True)
 
-    def _get_current_worker_id(self):
-        for _ in range(3):
-            workers = None
-            try:
-                workers = self._clientset.workers.list()
-            except Exception as e:
-                logger.debug(f"Failed to get workers: {e}")
-
-            if workers:
-                for worker in workers.items:
-                    if worker.name == self._worker_name:
-                        self._worker_id = worker.id
-                        break
-            time.sleep(1)
-
-        if not hasattr(self, "_worker_id"):
-            raise Exception("Failed to get current worker id.")
-
     async def watch_model_instances(self):
-        if not hasattr(self, "_worker_id"):
-            self._get_current_worker_id()
-
         while True:
-            await asyncio.sleep(5)
-            logger.debug("Started watching model instances.")
             try:
+                logger.info("Started watching model instances.")
                 await self._clientset.model_instances.awatch(
                     callback=self._handle_model_instance_event
                 )
+            except asyncio.CancelledError:
+                break
             except Exception as e:
                 logger.error(f"Failed watching model instances: {e}")
+                await asyncio.sleep(5)
+
+    async def monitor_error_instances(self):
+        """Periodically checks cached ERROR state instances and attempts to restart them."""
+        while True:
+            try:
+                logger.trace(
+                    f"Monitoring error instances, instances: {self._error_model_instances.keys()}"
+                )
+
+                for mi_id, mi in list(self._error_model_instances.items()):
+                    self._restart_error_instance(mi)
+                await asyncio.sleep(10)
+            except Exception as e:
+                logger.error(f"Error while monitoring instances: {e}")
+                await asyncio.sleep(5)
 
     def _handle_model_instance_event(self, event: Event):
-        mi = ModelInstance(**event.data)
+        mi = ModelInstance.model_validate(event.data)
 
         if mi.worker_id != self._worker_id:
             # Ignore model instances that are not assigned to this worker node.
             return
 
-        if mi.state == ModelInstanceStateEnum.ERROR:
+        logger.trace(
+            f"Received model instance event: {event.type} {mi.name} {mi.state}"
+        )
+
+        if mi.state == ModelInstanceStateEnum.ERROR and event.type == EventType.DELETED:
+            self._error_model_instances.pop(mi.id, None)
+            return
+        elif mi.state == ModelInstanceStateEnum.ERROR:
+            m = self._get_model_with_cache(mi)
+            if m.restart_on_error:
+                self._error_model_instances[mi.id] = mi
             return
 
-        if mi.id in self._serving_model_instances and event.type == EventType.DELETED:
+        elif mi.id in self._serving_model_instances and event.type == EventType.DELETED:
             self._stop_model_instance(mi)
         elif (
             mi.id in self._serving_model_instances
@@ -115,14 +126,21 @@ class ServeManager:
 
         try:
             if mi.port is None:
-                mi.port = network.get_free_port()
+                mi.port = network.get_free_port(
+                    port_range=self._config.service_port_range,
+                    unavailable_ports=set(self._serving_model_instance_ports.values()),
+                )
 
             logger.info(f"Start serving model instance {mi.name} on port {mi.port}")
+
+            model = self._get_model_with_cache(mi)
+            backend = get_backend(model)
 
             process = multiprocessing.Process(
                 target=ServeManager.serve_model_instance,
                 args=(
                     mi,
+                    backend,
                     self._clientset.headers,
                     log_file_path,
                     self._config,
@@ -131,6 +149,7 @@ class ServeManager:
             process.daemon = False
             process.start()
             self._serving_model_instances[mi.id] = process
+            self._serving_model_instance_ports[mi.id] = mi.port
             self._starting_model_instances[mi.id] = mi
 
             patch_dict = {
@@ -139,6 +158,10 @@ class ServeManager:
                 "pid": process.pid,
             }
             self._update_model_instance(mi.id, **patch_dict)
+
+            logger.debug(
+                f"Started serving model instance {mi.name} on port {mi.port}, pid {process.pid}"
+            )
 
         except Exception as e:
             patch_dict = {
@@ -156,6 +179,7 @@ class ServeManager:
     @staticmethod
     def serve_model_instance(
         mi: ModelInstance,
+        backend: BackendEnum,
         client_headers: dict,
         log_file_path: str,
         cfg: Config,
@@ -179,6 +203,8 @@ class ServeManager:
                     VLLMServer(clientset, mi, cfg).start()
                 elif backend == BackendEnum.VOX_BOX:
                     VoxBoxServer(clientset, mi, cfg).start()
+                elif backend == BackendEnum.ASCEND_MINDIE:
+                    AscendMindIEServer(clientset, mi, cfg).start()
                 else:
                     raise ValueError(f"Unsupported backend {backend}")
 
@@ -190,6 +216,15 @@ class ServeManager:
             setattr(mi, key, value)
 
         self._clientset.model_instances.update(id=id, model_update=mi)
+
+    def _get_model_with_cache(self, mi: ModelInstance) -> Model:
+        """Get model from cache or fetch from clientset."""
+        if mi.id in self._model_cache_by_instance:
+            return self._model_cache_by_instance[mi.id]
+
+        model = self._clientset.models.get(mi.model_id)
+        self._model_cache_by_instance[mi.id] = model
+        return model
 
     def _stop_model_instance(self, mi: ModelInstance):
         id = mi.id
@@ -205,7 +240,44 @@ class ServeManager:
             except Exception as e:
                 logger.error(f"Failed to terminate process {pid}: {e}")
 
-            self._serving_model_instances.pop(id)
+            self._post_stop_model_instance(id)
+
+    def _restart_error_instance(self, mi: ModelInstance):
+        """Attempts to restart a model instance that is in error state with exponential backoff."""
+        if mi.id in self._serving_model_instances:
+            logger.warning(
+                f"Model instance {mi.name} is already running, skipping restart."
+            )
+            return
+
+        restart_count = mi.restart_count or 0
+        last_restart_time = mi.last_restart_time or mi.updated_at
+
+        current_time = datetime.now(timezone.utc)
+        delay = min(
+            10 * (2 ** (restart_count - 1)), 300
+        )  # Exponential backoff, max 5 minutes
+        if last_restart_time:
+            elapsed_time = (current_time - last_restart_time).total_seconds()
+            if elapsed_time < delay:
+                logger.trace(
+                    f"Delaying restart of {mi.name} for {delay - elapsed_time:.2f} seconds."
+                )
+                return
+
+        logger.info(
+            f"Restarting model instance {mi.name} (attempt {restart_count + 1}) after {delay} seconds delay."
+        )
+
+        self._update_model_instance(
+            mi.id,
+            restart_count=restart_count + 1,
+            last_restart_time=current_time,
+            state=ModelInstanceStateEnum.SCHEDULED,
+            state_message="",
+        )
+
+        self._error_model_instances.pop(mi.id, None)
 
     def health_check_serving_instances(self):
         for id, process in list(self._serving_model_instances.items()):
@@ -224,12 +296,12 @@ class ServeManager:
                     pass
                 except Exception:
                     logger.error(f"Failed to update model instance {id} state.")
-                self._serving_model_instances.pop(id)
-                self._starting_model_instances.pop(id, None)
+                self._post_stop_model_instance(id)
             elif id in self._starting_model_instances:
                 # health check for starting model instances
                 mi = self._starting_model_instances[id]
-                if is_running(mi):
+                model = self._get_model_with_cache(mi)
+                if is_running(mi, model.backend):
                     mi = self._clientset.model_instances.get(id=id)
                     if mi.state != ModelInstanceStateEnum.ERROR:
                         self._update_model_instance(
@@ -237,11 +309,22 @@ class ServeManager:
                         )
                     self._starting_model_instances.pop(id, None)
 
+    def _post_stop_model_instance(self, id: str):
+        self._serving_model_instances.pop(id, None)
+        self._serving_model_instance_ports.pop(id, None)
+        self._starting_model_instances.pop(id, None)
+        self._model_cache_by_instance.pop(id, None)
 
-def is_running(mi: ModelInstance) -> bool:
+
+def is_running(mi: ModelInstance, backend: Optional[str]) -> bool:
     try:
-        # This endpoint is served by all backends (llama-box, vox-box, vllm)
+        # Check /v1/models by default if dedicated health check endpoint is not available.
+        # This is served by all backends (llama-box, vox-box, vllm)
         health_check_url = f"http://127.0.0.1:{mi.port}/v1/models"
+        if backend in [BackendEnum.LLAMA_BOX]:
+            # For llama-box, use /health to avoid printing error logs.
+            health_check_url = f"http://127.0.0.1:{mi.port}/health"
+
         response = requests.get(health_check_url, timeout=1)
         if response.status_code == 200:
             return True

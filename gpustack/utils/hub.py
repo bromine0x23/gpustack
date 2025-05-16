@@ -2,14 +2,32 @@ import logging
 from typing import List, Optional
 from pathlib import Path
 import fnmatch
+from threading import Lock
+from functools import cache
 from huggingface_hub import HfFileSystem
 from huggingface_hub.utils import validate_repo_id
 from modelscope.hub.api import HubApi
+from transformers import PretrainedConfig
+from huggingface_hub import HfApi
+from huggingface_hub.utils import GatedRepoError, HfHubHTTPError
+from requests.exceptions import HTTPError
 
 from gpustack.config.config import get_global_config
 from gpustack.schemas.models import Model, SourceEnum
 
 logger = logging.getLogger(__name__)
+
+
+MODELSCOPE_CONFIG_ALLOW_FILE_PATTERN = [
+    '*.json',
+    '*.py',
+]
+
+
+@cache
+def get_model_lock(model_id: str) -> Lock:
+    """Get or create a lock for the given model_id. The model_id is used as the key to store Lock in cache."""
+    return Lock()
 
 
 def match_hugging_face_files(
@@ -30,7 +48,7 @@ def match_hugging_face_files(
     file_list: List[str] = []
     for file in files:
         rel_path = Path(file).relative_to(repo_id)
-        file_list.append(str(rel_path))
+        file_list.append(rel_path.as_posix())
 
     matching_files = [file for file in file_list if fnmatch.fnmatch(file, filename)]  # type: ignore
     matching_files = sorted(matching_files)
@@ -80,6 +98,38 @@ def match_model_scope_file_paths(
     return matching_paths
 
 
+def get_model_weight_size(model: Model, token: Optional[str] = None) -> int:
+    """
+    Get the size of the model weights. This is the sum of all the weight files with extensions
+    .safetensors, .bin, .pt, .pth.
+    Args:
+        model: Model to get the weight size for
+        token: Optional Hugging Face API token
+    Returns:
+        int: The size of the model weights
+    """
+    weight_file_extensions = (".safetensors", ".bin", ".pt", ".pth")
+    if model.source == SourceEnum.HUGGING_FACE:
+        api = HfApi(token=token)
+        repo_info = api.repo_info(model.huggingface_repo_id, files_metadata=True)
+        total_size = sum(
+            sibling.size
+            for sibling in repo_info.siblings
+            if sibling.size is not None
+            and sibling.rfilename.endswith(weight_file_extensions)
+        )
+        return total_size
+    elif model.source == SourceEnum.MODEL_SCOPE:
+        api = HubApi()
+        files = api.get_model_files(model.model_scope_model_id, recursive=True)
+
+        return sum(
+            file["Size"]
+            for file in files
+            if file["Name"].endswith(weight_file_extensions)
+        )
+
+
 def get_pretrained_config(model: Model, **kwargs):
     """
     Get the pretrained config of the model from Hugging Face or ModelScope.
@@ -104,12 +154,29 @@ def get_pretrained_config(model: Model, **kwargs):
             trust_remote_code=trust_remote_code,
         )
     elif model.source == SourceEnum.MODEL_SCOPE:
-        from modelscope import AutoConfig
+        from modelscope import AutoConfig, snapshot_download
 
-        pretrained_config = AutoConfig.from_pretrained(
-            model.model_scope_model_id,
-            trust_remote_code=trust_remote_code,
-        )
+        try:
+
+            with get_model_lock(model.model_scope_model_id):
+                # Download first then load config locally.
+                # A temporary workaround for the issue:
+                # https://github.com/modelscope/modelscope/issues/1302
+                config_dir = snapshot_download(
+                    model.model_scope_model_id,
+                    allow_file_pattern=MODELSCOPE_CONFIG_ALLOW_FILE_PATTERN,
+                )
+
+                pretrained_config = AutoConfig.from_pretrained(
+                    config_dir,
+                    trust_remote_code=trust_remote_code,
+                )
+        except ValueError as e:
+            if config_dir in str(e):
+                # Make the message not confusing.
+                raise ValueError(str(e).replace(config_dir, model.model_scope_model_id))
+            else:
+                raise e
     elif model.source == SourceEnum.LOCAL_PATH:
         from transformers import AutoConfig
 
@@ -126,7 +193,7 @@ def get_pretrained_config(model: Model, **kwargs):
 # Simplified from vllm.config._get_and_verify_max_len
 # Keep in our codebase to avoid dependency on vllm's internal
 # APIs which may change unexpectedly.
-# https://github.com/vllm-project/vllm/blob/v0.6.2/vllm/config.py#L1668
+# https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/config.py#L2453
 def get_max_model_len(pretrained_config) -> int:  # noqa: C901
     """Get the model's maximum length."""
     derived_max_model_len = float("inf")
@@ -141,6 +208,8 @@ def get_max_model_len(pretrained_config) -> int:  # noqa: C901
         "seq_length",
         # Command-R
         "model_max_length",
+        # Whisper
+        "max_target_positions",
         # Others
         "max_sequence_length",
         "max_seq_length",
@@ -188,3 +257,95 @@ def get_max_model_len(pretrained_config) -> int:  # noqa: C901
 
     logger.debug(f"Derived max model length: {derived_max_model_len}")
     return int(derived_max_model_len)
+
+
+# Similar to https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/transformers_utils/config.py#L700,
+# But we don't assert and fail if num_attention_heads is missing.
+def get_hf_text_config(config: PretrainedConfig):
+    """Get the "sub" config relevant to llm for multi modal models.
+    No op for pure text models.
+    """
+    if hasattr(config, "text_config") and hasattr(
+        config.text_config, "num_attention_heads"
+    ):
+        return config.text_config
+    else:
+        return config
+
+
+quantization_list = [
+    "-IQ1_",
+    "-IQ2_",
+    "-IQ3_",
+    "-IQ4_",
+    "-Q2_",
+    "-Q3_",
+    "-Q4_",
+    "-Q5_",
+    "-Q6_",
+    "-Q8_",
+]
+
+
+def get_hugging_face_model_min_gguf_path(
+    model_id: str,
+    token: Optional[str] = None,
+) -> Optional[str]:
+    api = HfApi(token=token)
+    files = api.list_repo_files(model_id)
+
+    gguf_files = sorted([f for f in files if f.endswith(".gguf")])
+    if not gguf_files:
+        return None
+
+    for quantization in quantization_list:
+        for gguf_file in gguf_files:
+            if quantization in gguf_file.upper():
+                return gguf_file
+
+    return gguf_files[0]
+
+
+def auth_check(
+    model: Model,
+    huggingface_token: Optional[str] = None,
+):
+    if model.source == SourceEnum.HUGGING_FACE:
+        api = HfApi(token=huggingface_token)
+        try:
+            api.auth_check(model.huggingface_repo_id)
+        except GatedRepoError:
+            raise Exception(
+                "Access to the model is restricted. Please set a valid Huggingface token with proper permissions in the GPUStack server configuration."
+            )
+        except HfHubHTTPError as e:
+            if e.response.status_code in [401, 403]:
+                raise Exception(
+                    "Access to the model is restricted. Please set a valid Huggingface token with proper permissions in the GPUStack server configuration."
+                )
+    if model.source == SourceEnum.MODEL_SCOPE:
+        api = HubApi()
+        try:
+            api.get_model_files(model.model_scope_model_id)
+        except HTTPError as e:
+            if e.response.status_code in [401, 403, 404]:
+                raise Exception("Access to the model is restricted.")
+
+
+def get_model_scope_model_min_gguf_path(
+    model_id: str,
+) -> Optional[str]:
+    api = HubApi()
+    files = api.get_model_files(model_id, recursive=True)
+    file_paths: List[str] = [file["Path"] for file in files]
+
+    gguf_files = sorted([f for f in file_paths if f.endswith(".gguf")])
+    if not gguf_files:
+        return None
+
+    for quantization in quantization_list:
+        for gguf_file in gguf_files:
+            if quantization in gguf_file.upper():
+                return gguf_file
+
+    return gguf_files[0]

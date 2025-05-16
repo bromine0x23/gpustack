@@ -24,6 +24,7 @@ class WorkerStatusCollector:
         clientset: ClientSet = None,
         worker_manager=None,
         gpu_devices=None,
+        system_info=None,
     ):
         self._worker_name = worker_name
         self._hostname = socket.gethostname()
@@ -32,18 +33,27 @@ class WorkerStatusCollector:
         self._clientset = clientset
         self._worker_manager = worker_manager
 
-        detector_factory = (
-            DetectorFactory("custom", {"custom": [Custom(gpu_devices)]})
-            if gpu_devices
-            else None
-        )
-        self._detector_factory = (
-            detector_factory if detector_factory else DetectorFactory()
-        )
+        if gpu_devices and system_info:
+            self._detector_factory = DetectorFactory(
+                device="custom",
+                gpu_detectors={"custom": [Custom(gpu_devices=gpu_devices)]},
+                system_info_detector=Custom(system_info=system_info),
+            )
+        elif gpu_devices:
+            self._detector_factory = DetectorFactory(
+                device="custom",
+                gpu_detectors={"custom": [Custom(gpu_devices=gpu_devices)]},
+            )
+        elif system_info:
+            self._detector_factory = DetectorFactory(
+                system_info_detector=Custom(system_info=system_info)
+            )
+        else:
+            self._detector_factory = DetectorFactory()
 
     """A class for collecting worker status information."""
 
-    def collect(self) -> Worker:  # noqa: C901
+    def collect(self, initial: bool = False) -> Worker:  # noqa: C901
         """Collect worker status information."""
         status = WorkerStatus()
 
@@ -59,11 +69,12 @@ class WorkerStatusCollector:
         except Exception as e:
             logger.error(f"Failed to detect system info: {e}")
 
-        try:
-            gpu_devices = self._detector_factory.detect_gpus()
-            status.gpu_devices = gpu_devices
-        except Exception as e:
-            logger.error(f"Failed to detect GPU devices: {e}")
+        if not initial:
+            try:
+                gpu_devices = self._detector_factory.detect_gpus()
+                status.gpu_devices = gpu_devices
+            except Exception as e:
+                logger.error(f"Failed to detect GPU devices: {e}")
 
         self._inject_unified_memory(status)
         self._inject_computed_filesystem_usage(status)
@@ -78,12 +89,14 @@ class WorkerStatusCollector:
                 )
             status.rpc_servers = rps_server
 
+        state = WorkerStateEnum.NOT_READY if initial else WorkerStateEnum.READY
+
         return Worker(
             name=self._worker_name,
             hostname=self._hostname,
             ip=self._worker_ip,
             port=self._worker_port,
-            state=WorkerStateEnum.READY,
+            state=state,
             status=status,
         )
 
@@ -150,7 +163,12 @@ class WorkerStatusCollector:
             if status.memory is not None:
                 status.memory.allocated = allocated.ram
             if status.gpu_devices is not None:
-                for ag, agv in allocated.vram.items():
-                    status.gpu_devices[ag].memory.allocated = agv
+                for i, device in enumerate(status.gpu_devices):
+                    if device.index in allocated.vram:
+                        status.gpu_devices[i].memory.allocated = allocated.vram[
+                            device.index
+                        ]
+                    else:
+                        status.gpu_devices[i].memory.allocated = 0
         except Exception as e:
             logger.error(f"Failed to inject allocated resources: {e}")

@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 
 
 async def get_worker_allocatable_resource(  # noqa: C901
-    engine: AsyncEngine, worker: Worker
+    engine: AsyncEngine,
+    worker: Worker,
 ) -> Allocatable:
     """
     Get the worker with the latest allocatable resources.

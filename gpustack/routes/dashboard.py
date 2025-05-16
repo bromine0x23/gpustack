@@ -123,7 +123,7 @@ async def get_system_load(session: AsyncSession) -> SystemLoadSummary:
 
 async def get_model_usage(session: AsyncSession) -> ModelUsageSummary:
     today = date.today()
-    one_week_ago = today - timedelta(days=7)
+    one_month_ago = today - timedelta(days=31)
 
     statement = (
         select(
@@ -134,7 +134,7 @@ async def get_model_usage(session: AsyncSession) -> ModelUsageSummary:
             ),
             func.sum(ModelUsage.request_count).label('total_requests'),
         )
-        .where(ModelUsage.date >= one_week_ago)
+        .where(ModelUsage.date >= one_month_ago)
         .group_by(ModelUsage.date)
         .order_by(ModelUsage.date)
     )
@@ -179,7 +179,7 @@ async def get_model_usage(session: AsyncSession) -> ModelUsageSummary:
             ),
         )
         .join(User, ModelUsage.user_id == User.id)
-        .where(ModelUsage.date >= one_week_ago)
+        .where(ModelUsage.date >= one_month_ago)
         .group_by(ModelUsage.user_id, User.username)
         .order_by(
             func.sum(
@@ -245,6 +245,29 @@ def active_model_statement() -> select:
 
         ram_claim = func.cast(
             func.json_extract(ModelInstance.computed_resource_claim, '$.ram'),
+            BigInteger,
+        )
+    elif dialect == 'mysql':
+        vram_case = case(
+            (
+                func.json_type(
+                    func.json_extract(ModelInstance.computed_resource_claim, '$.vram')
+                )
+                == 'OBJECT',
+                func.json_extract(ModelInstance.computed_resource_claim, '$.vram'),
+            ),
+            else_=func.cast(cast({"0": 0}, JSON), JSON),
+        )
+
+        # Use text() to preserve the native SQL expression
+        vram_values = func.json_table(
+            vram_case, text("""'$.*' COLUMNS (value BIGINT PATH '$')""")
+        ).table_valued('value')
+
+        ram_claim = func.cast(
+            func.json_unquote(
+                func.json_extract(ModelInstance.computed_resource_claim, '$.ram')
+            ),
             BigInteger,
         )
     elif dialect == 'postgresql':

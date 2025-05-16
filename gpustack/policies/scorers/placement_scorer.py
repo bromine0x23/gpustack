@@ -2,7 +2,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
 import logging
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from gpustack.policies.base import (
     Allocatable,
@@ -58,11 +58,9 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
     def __init__(
         self,
         model: Model,
-        model_instance: Optional[ModelInstance] = None,
         scale_type: ScaleTypeEnum = ScaleTypeEnum.SCALE_UP,
     ):
         self._engine = get_engine()
-        self._model_instance = model_instance
         self._model = model
         self._resource_weight = ResourceWeight()
         self._model_weight = ModelWeight()
@@ -77,12 +75,7 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
         """
 
         logger.debug(
-            f"model {self._model.name}, score canidates with {self._scale_type} placement policy, instance {self._model_instance.name}"
-            + (
-                f", model_instance: {self._model_instance.name}"
-                if self._model_instance
-                else ""
-            )
+            f"model {self._model.readable_source}, score canidates with {self._scale_type} placement policy"
         )
 
         if self._model.placement_strategy == PlacementStrategyEnum.SPREAD:
@@ -290,10 +283,19 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
         score = 0
         gpu_count = len(gpu_indexes) if gpu_indexes else 0
 
-        def calculate_score(ram_claim, ram_allocatable, vram_claim, vram_allocatable):
-            ram_score = (
-                ram_claim / ram_allocatable * MaxScore * self._resource_weight.ram
-            )
+        def calculate_score(
+            ram_claim: Optional[int],
+            ram_allocatable: Optional[int],
+            vram_claim: Dict[int, int],
+            vram_allocatable: Dict[int, int],
+        ):
+            if ram_claim is None or ram_allocatable is None or ram_allocatable == 0:
+                ram_score = 0
+            else:
+                ram_score = (
+                    ram_claim / ram_allocatable * MaxScore * self._resource_weight.ram
+                )
+
             vram_score = (
                 vram_claim / vram_allocatable * MaxScore * self._resource_weight.vram
             )
@@ -464,7 +466,8 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
             score = 0
             for rpc_server in rpc_servers:
                 allocatable = await get_worker_allocatable_resource(
-                    self._engine, worker_map.get(rpc_server.worker_id)
+                    self._engine,
+                    worker_map.get(rpc_server.worker_id),
                 )
 
                 score += await self._score_binpack_item(
@@ -501,6 +504,9 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
             }
         """
 
+        if not hasattr(self._model, "id") or self._model.id is None:
+            return {}
+
         model_id = self._model.id
         model_instances = await get_model_instances(self._engine)
 
@@ -520,7 +526,7 @@ class PlacementScorer(ScheduleCandidatesScorer, ModelInstanceScorer):
             worker_model_instances_count_map[worker_id]["total"][key] += 1
 
         for model_instance in model_instances:
-            if self._model_instance and model_instance.id == self._model_instance.id:
+            if model_instance.worker_id is None:
                 continue
 
             is_current_model = model_instance.model_id == model_id

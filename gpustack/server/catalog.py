@@ -5,12 +5,14 @@ from typing import Dict, List, Optional
 from urllib.parse import urlparse
 from pathlib import Path
 from fastapi import APIRouter
-from pydantic import BaseModel, ConfigDict
 import requests
 import yaml
 
-from gpustack.schemas.models import (
-    ModelBase,
+from gpustack.schemas.model_sets import (
+    ModelSet,
+    ModelSetPublic,
+    ModelSpec,
+    ModelTemplate,
 )
 from gpustack.utils import file
 from gpustack.utils.compat_importlib import pkg_resources
@@ -20,46 +22,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-class ModelTemplate(ModelBase):
-    name: Optional[str] = None
-    quantizations: Optional[List[str]] = None
-    sizes: Optional[List[float]] = None
-
-
-class ModelSpec(ModelBase):
-    name: Optional[str] = None
-    quantization: Optional[str] = None
-    size: Optional[float] = None
-
-
-class ModelSetBase(BaseModel):
-    name: str
-    id: Optional[int] = None
-    description: Optional[str] = None
-    order: Optional[int] = None
-    home: Optional[str] = None
-    icon: Optional[str] = None
-    categories: Optional[List[str]] = None
-    capabilities: Optional[List[str]] = None
-    sizes: Optional[List[float]] = None
-    licenses: Optional[List[str]] = None
-    release_date: Optional[date] = None
-
-    model_config = ConfigDict(protected_namespaces=())
-
-
-class ModelSetPublic(ModelSetBase):
-    pass
-
-
-class ModelSet(ModelSetBase):
-    quantizations: Optional[List[str]] = None
-
-    templates: List[ModelTemplate]
-
-
 model_catalog: List[ModelSetPublic] = []
 model_set_specs: Dict[int, List[ModelSpec]] = {}
+model_set_specs_by_key: Dict[str, ModelSpec] = {}
 
 
 def get_model_catalog() -> List[ModelSet]:
@@ -107,7 +72,6 @@ def init_model_catalog(model_catalog_file: Optional[str] = None):
         global model_catalog
         model_catalog = convert_to_public(model_sets)
         init_model_set_specs(model_sets)
-        prepare_static_catalog_icons()
     except Exception as e:
         raise Exception(f"Failed to load model catalog: {e}")
 
@@ -142,17 +106,9 @@ def init_model_set_specs(model_sets: List[ModelSet]):
                 for quantization in quantizations:
                     spec = resolve_model_template(template, size, quantization)
                     specs.append(spec)
+                    if not model_set_specs_by_key.get(spec.model_source_key):
+                        model_set_specs_by_key[spec.model_source_key] = spec
         model_set_specs[model_set.id] = specs
-
-
-def prepare_static_catalog_icons():
-    source_dir = pkg_resources.files("gpustack").joinpath("assets/catalog_icons")
-    target_dir = pkg_resources.files("gpustack").joinpath("ui/static/catalog_icons")
-
-    if not os.path.exists(source_dir):
-        return
-
-    file.copy_with_owner(source_dir, target_dir)
 
 
 def prepare_chat_templates(data_dir: str):

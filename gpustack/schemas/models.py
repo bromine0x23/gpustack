@@ -1,15 +1,21 @@
 from datetime import datetime
 from enum import Enum
+import hashlib
 from pathlib import Path
-from typing import Annotated, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Annotated, Any, Dict, List, Optional, Union
 from pydantic import BaseModel, ConfigDict, model_validator, Field as PydanticField
 from sqlalchemy import JSON, Column
-from sqlmodel import Field, Relationship, SQLModel
+from sqlmodel import Field, Relationship, SQLModel, Text
 
-from gpustack.schemas.common import PaginatedList, pydantic_column_type
+from gpustack.schemas.common import PaginatedList, UTCDateTime, pydantic_column_type
 from gpustack.mixins import BaseModelMixin
+from gpustack.schemas.links import ModelInstanceModelFileLink
 from gpustack.schemas.workers import RPCServer
 from gpustack.utils.command import find_parameter
+
+if TYPE_CHECKING:
+    from gpustack.schemas.model_files import ModelFile
+
 
 # Models
 
@@ -28,6 +34,7 @@ class CategoryEnum(str, Enum):
     RERANKER = "reranker"
     SPEECH_TO_TEXT = "speech_to_text"
     TEXT_TO_SPEECH = "text_to_speech"
+    UNKNOWN = "unknown"
 
 
 class PlacementStrategyEnum(str, Enum):
@@ -39,6 +46,7 @@ class BackendEnum(str, Enum):
     LLAMA_BOX = "llama-box"
     VLLM = "vllm"
     VOX_BOX = "vox-box"
+    ASCEND_MINDIE = "ascend-mindie"
 
 
 class GPUSelector(BaseModel):
@@ -54,6 +62,47 @@ class ModelSource(BaseModel):
     model_scope_model_id: Optional[str] = None
     model_scope_file_path: Optional[str] = None
     local_path: Optional[str] = None
+
+    @property
+    def model_source_key(self) -> str:
+        """Returns a unique identifier for the model, independent of quantization."""
+        if self.source == SourceEnum.HUGGING_FACE:
+            return self.huggingface_repo_id or ""
+        elif self.source == SourceEnum.OLLAMA_LIBRARY:
+            return self.ollama_library_model_name or ""
+        elif self.source == SourceEnum.MODEL_SCOPE:
+            return self.model_scope_model_id or ""
+        elif self.source == SourceEnum.LOCAL_PATH:
+            return self.local_path or ""
+        return ""
+
+    @property
+    def readable_source(self) -> str:
+        values = []
+        if self.source == SourceEnum.HUGGING_FACE:
+            values.extend([self.huggingface_repo_id, self.huggingface_filename])
+        elif self.source == SourceEnum.OLLAMA_LIBRARY:
+            values.extend([self.ollama_library_model_name])
+        elif self.source == SourceEnum.MODEL_SCOPE:
+            values.extend([self.model_scope_model_id, self.model_scope_file_path])
+        elif self.source == SourceEnum.LOCAL_PATH:
+            values.extend([self.local_path])
+
+        return "/".join([value for value in values if value is not None])
+
+    @property
+    def model_source_index(self) -> str:
+        values = []
+        if self.source == SourceEnum.HUGGING_FACE:
+            values.extend([self.huggingface_repo_id, self.huggingface_filename])
+        elif self.source == SourceEnum.OLLAMA_LIBRARY:
+            values.extend([self.ollama_library_model_name])
+        elif self.source == SourceEnum.MODEL_SCOPE:
+            values.extend([self.model_scope_model_id, self.model_scope_file_path])
+        elif self.source == SourceEnum.LOCAL_PATH:
+            values.extend([self.local_path])
+
+        return hashlib.sha256(self.readable_source.encode()).hexdigest()
 
     @model_validator(mode="after")
     def check_huggingface_fields(self):
@@ -85,9 +134,11 @@ class ModelSource(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
 
-class ModelBase(SQLModel, ModelSource):
+class ModelSpecBase(SQLModel, ModelSource):
     name: str = Field(index=True, unique=True)
-    description: Optional[str] = None
+    description: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
     meta: Optional[Dict[str, Any]] = Field(sa_column=Column(JSON), default={})
 
     replicas: int = Field(default=1, ge=0)
@@ -114,8 +165,8 @@ class ModelBase(SQLModel, ModelSource):
         PydanticField(default=False, deprecated="Deprecated, use categories instead"),
     ]
     placement_strategy: PlacementStrategyEnum = PlacementStrategyEnum.SPREAD
-    cpu_offloading: bool = False
-    distributed_inference_across_workers: bool = False
+    cpu_offloading: Optional[bool] = None
+    distributed_inference_across_workers: Optional[bool] = None
     worker_selector: Optional[Dict[str, str]] = Field(
         sa_column=Column(JSON), default={}
     )
@@ -127,6 +178,24 @@ class ModelBase(SQLModel, ModelSource):
     backend_version: Optional[str] = None
     backend_parameters: Optional[List[str]] = Field(sa_column=Column(JSON), default=[])
 
+    env: Optional[Dict[str, str]] = Field(sa_column=Column(JSON), default={})
+    restart_on_error: Optional[bool] = True
+    distributable: Optional[bool] = False
+
+    @model_validator(mode="after")
+    def set_defaults(self):
+        backend = get_backend(self)
+        if self.cpu_offloading is None:
+            self.cpu_offloading = True if backend == BackendEnum.LLAMA_BOX else False
+
+        if self.distributed_inference_across_workers is None:
+            self.distributed_inference_across_workers = (
+                True if backend in [BackendEnum.LLAMA_BOX, BackendEnum.VLLM] else False
+            )
+        return self
+
+
+class ModelBase(ModelSpecBase):
     @model_validator(mode="after")
     def validate(self):
         backend = get_backend(self)
@@ -138,14 +207,17 @@ class ModelBase(SQLModel, ModelSource):
         elif backend == BackendEnum.VLLM:
             if self.cpu_offloading:
                 raise ValueError("CPU offloading is only supported for GGUF models")
-            if self.distributed_inference_across_workers:
-                raise ValueError(
-                    "Distributed inference accross workers is only supported for GGUF models"
-                )
         elif backend == BackendEnum.VOX_BOX:
             if self.distributed_inference_across_workers:
                 raise ValueError(
-                    "Distributed inference accross workers is only supported for GGUF models"
+                    "Distributed inference across workers is not supported for the vox-box backend"
+                )
+        elif backend == BackendEnum.ASCEND_MINDIE:
+            if self.cpu_offloading:
+                raise ValueError("CPU offloading is only supported for GGUF models")
+            if self.distributed_inference_across_workers:
+                raise ValueError(
+                    "Distributed inference across workers is not supported for the ascend-mindie backend"
                 )
         return self
 
@@ -154,7 +226,6 @@ class Model(ModelBase, BaseModelMixin, table=True):
     __tablename__ = 'models'
     id: Optional[int] = Field(default=None, primary_key=True)
 
-    distributable: Optional[bool] = False
     instances: list["ModelInstance"] = Relationship(
         sa_relationship_kwargs={"cascade": "delete", "lazy": "selectin"},
         back_populates="model",
@@ -211,10 +282,23 @@ class ModelInstanceRPCServer(RPCServer):
     )
 
 
+class RayActor(BaseModel):
+    worker_id: Optional[int] = None
+    worker_ip: Optional[str] = None
+    total_gpus: Optional[int] = None
+    gpu_indexes: Optional[List[int]] = None
+    computed_resource_claim: Optional[ComputedResourceClaim] = Field(
+        sa_column=Column(pydantic_column_type(ComputedResourceClaim)), default=None
+    )
+    download_progress: Optional[float] = None
+
+
 class DistributedServers(BaseModel):
     rpc_servers: Optional[List[ModelInstanceRPCServer]] = Field(
         sa_column=Column(JSON), default=[]
     )
+
+    ray_actors: Optional[List[RayActor]] = Field(sa_column=Column(JSON), default=[])
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -227,8 +311,15 @@ class ModelInstanceBase(SQLModel, ModelSource):
     pid: Optional[int] = None
     port: Optional[int] = None
     download_progress: Optional[float] = None
+    resolved_path: Optional[str] = None
+    restart_count: Optional[int] = 0
+    last_restart_time: Optional[datetime] = Field(
+        sa_column=Column(UTCDateTime), default=None
+    )
     state: ModelInstanceStateEnum = ModelInstanceStateEnum.PENDING
-    state_message: Optional[str] = None
+    state_message: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
     computed_resource_claim: Optional[ComputedResourceClaim] = Field(
         sa_column=Column(pydantic_column_type(ComputedResourceClaim)), default=None
     )
@@ -251,6 +342,12 @@ class ModelInstance(ModelInstanceBase, BaseModelMixin, table=True):
 
     model: Optional[Model] = Relationship(
         back_populates="instances",
+        sa_relationship_kwargs={"lazy": "selectin"},
+    )
+
+    model_files: List["ModelFile"] = Relationship(
+        back_populates="instances",
+        link_model=ModelInstanceModelFileLink,
         sa_relationship_kwargs={"lazy": "selectin"},
     )
 
@@ -278,7 +375,7 @@ class ModelInstancePublic(
 ModelInstancesPublic = PaginatedList[ModelInstancePublic]
 
 
-def is_gguf_model(model: Model):
+def is_gguf_model(model: Union[Model, ModelSource]):
     """
     Check if the model is a GGUF model.
     Args:
@@ -301,7 +398,7 @@ def is_gguf_model(model: Model):
             and model.local_path
             and model.local_path.endswith(".gguf")
         )
-        or (model.backend == BackendEnum.LLAMA_BOX)
+        or (hasattr(model, "backend") and model.backend == BackendEnum.LLAMA_BOX)
     )
 
 
@@ -362,16 +459,17 @@ def get_backend(model: Model) -> str:
     return BackendEnum.VLLM
 
 
-def get_mmproj_filename(model: Model) -> Optional[str]:
+def get_mmproj_filename(model: Union[Model, ModelSource]) -> Optional[str]:
     """
     Get the mmproj filename for the model. If the mmproj is not provided in the model's
     backend parameters, it will try to find the default mmproj file.
     """
-    if get_backend(model) != BackendEnum.LLAMA_BOX:
+    if not is_gguf_model(model):
         return None
 
-    mmproj = find_parameter(model.backend_parameters, ["mmproj"])
-    if mmproj and Path(mmproj).name == mmproj:
-        return mmproj
+    if hasattr(model, "backend_parameters"):
+        mmproj = find_parameter(model.backend_parameters, ["mmproj"])
+        if mmproj and Path(mmproj).name == mmproj:
+            return mmproj
 
     return "*mmproj*.gguf"

@@ -47,10 +47,16 @@ class VoxBoxServer(InferenceServer):
 
             arguments.extend(built_in_arguments)
 
-            env = os.environ.copy()
-
             logger.info("Starting vox-box server")
             logger.debug(f"Run vox-box with arguments: {' '.join(arguments)}")
+            if self._model.env:
+                logger.debug(
+                    f"Model environment variables: {', '.join(f'{key}={value}' for key, value in self._model.env.items())}"
+                )
+
+            env = os.environ.copy()
+            env.update(self._model.env or {})
+
             result = subprocess.run(
                 [command_path] + arguments,
                 stdout=sys.stdout,
